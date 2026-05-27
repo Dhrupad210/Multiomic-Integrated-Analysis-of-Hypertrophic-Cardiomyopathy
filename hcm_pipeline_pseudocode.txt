@@ -1,0 +1,338 @@
+HCM scRNA-seq Multi-Omics Analysis Pipeline - Pseudocode
+================================================================================
+
+STAGE 0: CONFIGURATION & SETUP
+-------------------------------
+1. Define Config class with all file paths, parameters, and colour palettes
+2. Define gene sets: HCM_CORE, IMMUNE, EPI_GENES, EPI_CATEGORIES, CARDIAC_TFS, BULK_MODULES
+3. Define patient-plate mapping (P1-P4)
+4. Set up logging utilities (timestamped file + stdout)
+5. Define checkpoint save/load functions
+
+STAGE 1: DATA LOADING
+----------------------
+FOR each patient in [P1, P2, P3, P4]:
+    FOR each plate file in patient.plates:
+        LOAD tsv.gz file (genes x cells)
+        TRANSPOSE to cells x genes
+        CLEAN gene names (split on '__', make unique)
+        ATTACH metadata: patient_id, plate_id
+        APPEND to list
+CONCATENATE all plates with batch labels
+REPORT: total cells x genes
+
+STAGE 2: PREPROCESSING
+----------------------
+FILTER out junk genes:
+    - MT-* (mitochondrial)
+    - ERCC-* (spike-ins)
+    - RPS*, RPL* (ribosomal)
+STORE raw counts in .raw
+NORMALIZE total counts to 10,000 per cell
+LOG1P transform
+SANITY CHECK: max value should be 1-10
+
+STAGE 3: REFERENCE MAPPING
+---------------------------
+LOAD reference AnnData (healthy vCM1-4)
+FIND intersection of genes between query and reference
+SUBSET both to common genes
+RUN scanpy.tl.ingest() to map query onto reference
+    -> produces 'cell_states' annotation (vCM1, vCM2, vCM3, vCM4)
+PRINT crosstab: patient_id vs cell_states (counts + percentages)
+
+STAGE 4: HVG SELECTION
+----------------------
+COMPUTE highly variable genes (seurat_v3, top 5000)
+COPY full object for reference
+SUBSET working object to HVGs only
+
+STAGE 5: GENE MODULE SCORING
+-----------------------------
+FOR each gene set [HCM_CORE, IMMUNE, EPI]:
+    FILTER to genes present in dataset
+    COMPUTE module score using scanpy.tl.score_genes()
+    LOG: N/M genes used
+
+STAGE 6: CLUSTERING & TRAJECTORY
+---------------------------------
+COMPUTE PCA (arpack solver)
+COMPUTE neighbors (n=15, use PCA)
+COMPUTE UMAP
+
+FOR resolution in [0.3, 0.5, ..., 1.9]:
+    RUN Leiden clustering
+    RECORD number of clusters
+PLOT resolution scan (resolution vs n_clusters)
+AUTO-SELECT resolution: first point where cluster count stabilizes (delta <= 2)
+APPLY chosen resolution -> 'leiden' column
+
+RUN PAGA on leiden clusters
+COMPUTE mean HCM_score per cluster
+FIND root cluster = lowest HCM_score
+SET root cell = cell with minimum HCM_score in root cluster
+COMPUTE diffusion pseudotime (DPT)
+
+BUILD TRAJECTORY:
+    Start at root cluster
+    FOR each step:
+        Examine PAGA connectivity to unvisited neighbors
+        Prefer neighbors with higher HCM_score (weight > 0.05)
+        If no valid candidates, pick strongest connection
+        Append to path
+    RETURN ordered list of cluster IDs
+
+STAGE 7: PSEUDOTIME ANALYSIS
+-----------------------------
+FILTER cells with pseudotime >= 1.0 (artifacts)
+BIN pseudotime into 10 equal bins
+COMPUTE mean module scores per bin
+PLOT: line plot of HCM/Immune/Epi scores across bins
+
+STAGE 8: PSEUDO-BULK DIFFERENTIAL EXPRESSION
+----------------------------------------------
+SPLIT trajectory into early half and late half clusters
+SUBSET adata to trajectory cells only
+LABEL cells as 'Early' or 'Late'
+
+COMPUTE pseudobulk:
+    FOR each group [Early, Late]:
+        AVERAGE expression across all cells in group
+        (use raw counts if available)
+    RETURN DataFrame: genes x groups
+
+COMPUTE log2 fold change: Late vs Early
+SAVE pseudobulk tables
+PLOT: barplot of top 30 upregulated and top 30 downregulated genes
+
+STAGE 9: GSEA
+--------------
+RANK genes by log2FC (descending)
+REMOVE duplicates
+
+FOR each GMT file [GO_BP, GO_MF, KEGG]:
+    IF file exists:
+        RUN preranked GSEA (500 permutations)
+        APPLY BH FDR correction
+        FILTER significant terms (FDR < 0.25)
+        SAVE results table
+        IF significant terms exist:
+            PLOT lollipop: NES vs top terms
+    ELSE:
+        SKIP (log warning)
+
+STAGE 10: MARKER GENE ANALYSIS
+-------------------------------
+RUN rank_genes_groups (wilcoxon) on leiden clusters
+
+BUILD MANUAL DOTPLOT (avoids scanpy dendrogram bug):
+    FOR each cluster in trajectory:
+        GET top 4 marker genes
+    DEDUPLICATE while preserving order
+    COMPUTE per cluster:
+        - mean expression per gene
+        - % cells expressing per gene
+    NORMALIZE expression per gene (0-1)
+    PLOT:
+        - x-axis: genes (grouped by cluster)
+        - y-axis: clusters (trajectory order)
+        - dot size: % expressing
+        - dot colour: normalized mean expression (Reds)
+        - vertical lines: cluster boundaries
+    ADD colourbar + size legend
+
+STAGE 11: LIANA CELL-CELL COMMUNICATION (optional)
+----------------------------------------------------
+IF liana installed:
+    COPY trajectory adata
+    SET raw = None (prevent shape mismatch with HVG subset)
+    RUN rank_aggregate (n_perms=100)
+    SAVE interaction table
+ELSE:
+    SKIP
+
+STAGE 12: EPIGENETIC ANALYSIS
+------------------------------
+LOAD epifactors database (or use curated list)
+GET expressed epifactors from EPI_CATEGORIES
+
+PER-CLUSTER HEATMAP:
+    FOR each cluster in trajectory:
+        COMPUTE mean expression per epifactor
+    Z-SCORE normalize
+    PLOT clustermap with row colours by epigenetic category
+
+CATEGORY-LEVEL ACTIVITY:
+    FOR each category [Writers_KMT, Erasers_HDAC, ...]:
+        FOR each cluster:
+            COMPUTE mean expression of category genes
+    NORMALIZE per category (0-1)
+    PLOT:
+        - heatmap: category x cluster
+        - stacked bar: category composition per cluster
+
+VCM-SPECIFIC SWITCH POINTS:
+    FOR each vCM type [vCM1, vCM3, vCM4]:
+        IF n_cells >= 20:
+            FOR each expressed epifactor:
+                COMPUTE Spearman correlation with pseudotime
+                IF std > 1e-6:
+                    RECORD correlation + p-value
+    BH correct p-values per vCM type
+    SAVE table
+    PLOT: barplot of top/bottom correlations per vCM type
+
+STAGE 13: TF vs EPIGENETIC TIMING
+-----------------------------------
+GET expressed TFs from BULK_TFS list
+GET expressed epifactors
+
+COMPUTE pseudotime-binned expression:
+    FOR each gene:
+        BIN cells by pseudotime (10 bins)
+        COMPUTE mean expression per bin
+    RETURN DataFrame: bins x genes
+
+PLOT:
+    - heatmap: TF expression across bins (z-scored)
+    - heatmap: epifactor expression across bins (sorted by peak bin)
+    - line plot: mean TF activity vs mean epifactor activity per bin
+      (with Pearson correlation, handling NaN/Inf safely)
+
+LEAD-LAG ANALYSIS (optional):
+    FOR each TF-epifactor pair:
+        TEST cross-correlation at lags [-2, -1, 0, 1, 2]
+        RECORD best lag and correlation
+    SUMMARIZE: count of TF-leads, synchronous, Epi-leads
+    PLOT: bar chart of lead/lag counts
+
+STAGE 14: H3K27ac ChIP-seq INTEGRATION (optional)
+--------------------------------------------------
+IF pyranges installed AND files exist:
+    LOAD ChIP-seq peak table
+    DETECT disease (DCM/HF) and control (NF/Normal) columns
+    COMPUTE mean signal per condition
+    COMPUTE delta_H3K27ac = disease - control
+    FILTER significant peaks (FDR < 0.05 if available)
+    SPLIT into gained (delta>0) and lost (delta<0)
+
+    LOAD promoter BED (TSS +/- 5kb)
+    STANDARDIZE chromosome names (add 'chr' prefix)
+
+    OVERLAP peaks with promoters using pyranges:
+        - gained peaks -> gained gene scores
+        - lost peaks -> lost gene scores
+
+    BUILD gene lists:
+        - top 500 gained genes present in scRNA data
+        - top 500 lost genes present in scRNA data
+
+    SCORE cells:
+        - H3K27ac_gained_score (active enhancers in disease)
+        - H3K27ac_lost_score (silenced enhancers)
+        - H3K27ac_net_score = gained - lost
+
+    PLOT:
+        - UMAP: gained, lost, net scores
+        - violin per trajectory cluster
+        - scatter: pseudotime vs net score (Spearman correlation)
+ELSE:
+    SKIP
+
+STAGE 15: WGCNA & REGULON SCORING
+----------------------------------
+IF WGCNA module CSV exists:
+    FOR each module:
+        PARSE top 50 genes
+        SCORE on single cells
+    RETURN list of score columns
+
+IF Regulon CSV exists:
+    FOR each regulon:
+        PARSE gene list
+        SCORE on single cells
+    RETURN list of score columns
+
+STAGE 16: PER-PATIENT STATISTICS
+---------------------------------
+BUILD working dataframe:
+    - cell_states (vCM1, vCM3, vCM4)
+    - all WGCNA and regulon scores
+    - binary is_disease = (vCM3 or vCM4)
+
+FOR each patient:
+    SPLIT into healthy (vCM1) and disease (vCM3+vCM4)
+    FOR each score column:
+        IF both groups have >= 3 cells:
+            COMPUTE:
+                - Point-biserial correlation (disease vs score)
+                - Mann-Whitney U test
+                - AUROC (from U statistic)
+                - Cohen's d (effect size)
+    BH correct p-values per patient
+
+SAVE full statistics table
+PLOT:
+    - heatmap: point-biserial r per patient
+    - heatmap: -log10(FDR) with significance stars
+    - heatmap: Cohen's d (effect size)
+    - heatmap: AUROC
+    - lollipop: ranked mean Cohen's d with error bars
+    - stripplot: top 4 features per patient (violin + individual points)
+    - scatter: consistency (mean |d|) vs agreement fraction
+
+STAGE 17: TF-EPIGENETIC GRN
+----------------------------
+GET expressed TFs and epifactors from trajectory data
+COMPUTE Pearson correlation matrix
+
+BUILD NETWORK:
+    threshold = 0.35 (or auto: 80th percentile of |r|)
+    FOR each gene pair:
+        IF |r| >= threshold:
+            ADD edge with weight=|r|, sign=sign(r)
+    REMOVE isolated nodes
+
+COMPUTE network metrics:
+    - degree, strength, betweenness, closeness
+    - eigenvector centrality, PageRank, clustering coefficient
+    - HITS hub/authority scores
+    - local efficiency, constraint (Burt)
+    - community detection (Louvain/greedy modularity)
+    - graph-level: density, avg path length, modularity, small-world sigma
+
+SAVE:
+    - node metrics table
+    - edge metrics table
+    - graph summary table
+    - community enrichment table
+
+PLOT:
+    - Main network: node size=eigenvector, colour=community, border=TF
+    - 4-panel centrality maps (degree, betweenness, closeness, pagerank)
+    - HITS hub vs authority scatter
+    - Clustering vs degree (rich-club check)
+    - Degree distribution (linear + log-log)
+    - Edge weight distribution (all, by type, by sign)
+    - Community subgraphs (top 6)
+    - Node ranking lollipops (all metrics)
+
+STAGE 18: FINAL SUMMARY
+------------------------
+LIST all output files with sizes
+REPORT pipeline completion
+RETURN: adata_hcm (full), adata_traj (trajectory subset)
+
+================================================================================
+KEY FIXES APPLIED (vs original notebook)
+================================================================================
+1. NaN/Inf handling in pearsonr (TF-Epi correlation) - drop invalid bins
+2. Manual dotplot instead of rank_genes_groups_dotplot (avoids dendrogram crash)
+3. LIANA: raw=None to prevent shape mismatch (8400 vs 5000 genes)
+4. Epigenetic heatmap: explicit .astype(float) to prevent object dtype
+5. BH correction: use statsmodels multipletests instead of broken formula
+6. Safe colour palette: build dynamically from actual categories, fallback grey
+7. Checkpointing after major stages for recovery
+8. Optional dependencies with graceful degradation (gseapy, liana, pyranges)
+9. Consolidated repeated code into reusable functions
+10. Proper type hints and docstrings throughout

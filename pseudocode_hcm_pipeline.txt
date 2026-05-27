@@ -1,0 +1,281 @@
+================================================================================
+PSEUDOCODE — HCM Single-Cell RNA-seq Analysis Pipeline
+================================================================================
+
+Script 01 : Preprocessing, Reference Mapping & Trajectory
+Script 02 : Enrichment, Cell–Cell Communication & Epigenetics
+
+--------------------------------------------------------------------------------
+SCRIPT 01 PSEUDOCODE
+01_hcm_preprocessing_trajectory
+--------------------------------------------------------------------------------
+
+PURPOSE
+  Build a clean, annotated AnnData object from raw plate TSVs,
+  project cells onto a healthy atlas, score disease severity,
+  cluster cells, and derive a PAGA trajectory graph.
+
+────────────────────────────────────────────
+FUNCTION load_and_clean_plate(path, patient, plate):
+  READ gzipped TSV  →  Genes × Cells matrix
+  TRANSPOSE         →  Cells × Genes matrix
+  FOR each gene name:
+      STRIP chromosome suffix  (e.g. "ACTB__chr7"  →  "ACTB")
+  MAKE gene names unique
+  ADD patient_id and plate_id to cell metadata
+  RETURN AnnData
+
+FUNCTION load_all_plates(patients_dict):
+  FOR each patient in patients_dict:
+      FOR each plate in patient's list:
+          CALL load_and_clean_plate
+          APPEND result to collection
+  CONCATENATE all plates  (inner join on shared genes)
+  MAKE cell names unique
+  RETURN merged AnnData
+
+────────────────────────────────────────────
+FUNCTION remove_junk_genes(adata):
+  MARK genes whose name starts with:
+      MT-    (mitochondrial)
+      ERCC-  (spike-in controls)
+      RPS    (ribosomal small subunit)
+      RPL    (ribosomal large subunit)
+  REMOVE marked genes
+  PRINT cell count × remaining gene count
+  RETURN filtered AnnData
+
+────────────────────────────────────────────
+FUNCTION normalize_and_log(adata):
+  SAVE raw counts to adata.raw   (needed for DE later)
+  NORMALIZE each cell to 10,000 total counts  (CPM-style)
+  APPLY log1p transformation
+  CHECK max value in matrix:
+      IF max > 10  →  RAISE error (not normalized)
+      IF max < 1   →  RAISE error (double log-transformed)
+  PRINT max, mean values
+  RETURN processed AnnData
+
+────────────────────────────────────────────
+FUNCTION align_and_ingest(query_adata, ref_path):
+  LOAD healthy reference atlas from .h5ad file
+  FIND intersection of gene names (query ∩ reference)
+  SUBSET both objects to common genes
+  RUN sc.tl.ingest:
+      PROJECT query PCA coordinates into reference PCA space
+      ASSIGN nearest reference 'cell_states' label per cell
+  FREE reference from memory
+  RETURN annotated query AnnData
+
+────────────────────────────────────────────
+FUNCTION score_hcm_genes(adata):
+  DEFINE HCM marker set: [NPPA, NPPB, ANKRD1, ACTA1, MYH7]
+  FILTER to markers present in the dataset
+  COMPUTE per-cell HCM_score  (scanpy score_genes)
+  PRINT mean HCM_score per patient
+  RETURN scored AnnData
+
+────────────────────────────────────────────
+FUNCTION cluster_and_paga(adata):
+  BUILD kNN graph  (k=15, using ingest PCA embedding)
+  COMPUTE UMAP embedding
+  RUN Leiden clustering
+  FIND root cell:
+      SUBSET to vCM1 (healthiest reference state)
+      SELECT cell with MINIMUM HCM_score
+      SET as adata.uns['iroot']
+  ASSIGN default colour palette to Leiden clusters
+  COMPUTE PAGA connectivity graph
+  SORT clusters by mean HCM_score  →  confirm healthy-to-diseased order
+  RETURN clustered AnnData
+
+────────────────────────────────────────────
+FUNCTION export_paga_matrix(adata, out_path):
+  EXTRACT sparse PAGA connectivity matrix from adata.uns
+  CONVERT to dense DataFrame  (rows = columns = Leiden cluster IDs)
+  SAVE as tab-separated file
+  RETURN DataFrame
+
+────────────────────────────────────────────
+MAIN (Script 01):
+  DEFINE patient → plate file manifest
+  CALL load_all_plates
+  CALL remove_junk_genes
+  CALL normalize_and_log
+  CALL align_and_ingest
+  CALL score_hcm_genes
+  CALL cluster_and_paga
+  CALL export_paga_matrix
+  SAVE annotated AnnData  →  hcm_annotated.h5ad
+
+================================================================================
+
+--------------------------------------------------------------------------------
+SCRIPT 02 PSEUDOCODE
+02_hcm_enrichment_ccc_epigenetics
+--------------------------------------------------------------------------------
+
+PURPOSE
+  Characterise the optimal disease trajectory (clusters 11→5→16→10→8→13)
+  through differential expression, pathway enrichment, ligand–receptor
+  communication analysis, and epigenetic regulator profiling.
+
+CONSTANTS
+  PATH_CLUSTERS    = [11, 5, 16, 10, 8, 13]
+  GENE_SET_DBS     = [GO_BP, GO_MF, GO_CC, KEGG]
+  EPIFACTORS       = [list of 63 chromatin/DNA-methylation regulators]
+
+────────────────────────────────────────────
+SECTION A — Differential Expression
+
+FUNCTION run_differential_expression(adata):
+  RUN Wilcoxon rank-sum (each Leiden cluster vs all others)
+  FOR each cluster in PATH_CLUSTERS:
+      EXTRACT full DE table for that cluster
+      SAVE upregulated genes   →  cluster_<ID>_up_vs_rest.csv
+      SAVE downregulated genes →  cluster_<ID>_down_vs_rest.csv
+  RETURN dict {cluster_id: DE_dataframe}
+
+FUNCTION plot_path_dotplot(adata):
+  FOR each path cluster:
+      SELECT top 3 marker genes by Wilcoxon score
+  DEDUPLICATE the combined marker list
+  SUBSET adata to path clusters only  (avoids category mismatch)
+  PLOT scanpy DotPlot  (dot size = fraction expressing, colour = expression)
+  SAVE figure
+
+────────────────────────────────────────────
+SECTION B — Pathway Enrichment (Enrichr / gseapy)
+
+FUNCTION run_pathway_enrichment(de_results):
+  FOR each cluster in PATH_CLUSTERS:
+      TAKE top-50 upregulated genes
+      SAVE gene list as plain text file
+      QUERY Enrichr API  (GO_BP, GO_MF, GO_CC, KEGG)
+      SAVE results under enrichr_results/cluster_<ID>/
+      IF no terms pass FDR < 0.05  →  LOG warning and continue
+
+FUNCTION plot_enrichment_grid(database):
+  CREATE 2×3 subplot grid
+  FOR each cluster in PATH_CLUSTERS:
+      LOAD Enrichr result file for this cluster + database
+      IF file missing  →  display "no significant terms" panel
+      COMPUTE  −log10(Adjusted P-value)
+      PARSE overlap string  →  gene_count integer
+      DRAW lollipop plot:
+          horizontal stick   = significance (x-axis)
+          dot colour         = significance (viridis)
+          dot size           = number of overlapping genes
+  ADD shared title and axis labels
+  SAVE figure at 300 dpi
+
+FUNCTION export_functional_summary():
+  FOR each cluster in PATH_CLUSTERS:
+      LOAD GO_CC, GO_BP, KEGG results
+      SELECT columns: Term, Combined Score, Adjusted P-value
+      CONCATENATE three databases side-by-side  (9 columns total)
+      SAVE as Cluster_<ID>_Functional_Summary.tsv
+
+────────────────────────────────────────────
+SECTION C — Cell–Cell Communication (LIANA)
+
+FUNCTION run_liana(adata):
+  ENSURE leiden column is categorical
+  RUN li.mt.rank_aggregate:
+      Consensus of CellPhoneDB, Connectome, log2FC, NATMI, SingleCellSignalR
+      Use adata.raw  (expands feature set from 7686 → 8400 genes)
+  STORE results in adata.uns['liana_res']
+  RETURN liana_res DataFrame
+
+  NOTE: Cluster 5 appears only as a source (never target) due to limited
+        receptor/ligand gene coverage — this is a dataset limitation.
+
+FUNCTION extract_transition_signals(liana_res, source, target):
+  FILTER rows where source == given cluster AND target == given cluster
+  IF empty  →  LOG warning (data limitation)
+  SORT by magnitude_rank  (lower = more significant)
+  PRINT top-10 ligand–receptor pairs
+  SAVE full filtered table as CSV
+  RETURN filtered DataFrame
+
+FUNCTION plot_liana_dotplot(adata, liana_res):
+  IDENTIFY which path clusters appear as sources and targets in data
+  IF none found  →  SKIP with warning
+  CALL li.pl.dotplot:
+      colour = magnitude_rank  (inverted: high rank → low colour)
+      size   = specificity_rank
+      top_n  = 20 interactions
+  SAVE plot via plotnine .save()  (avoids matplotlib backend conflicts)
+
+────────────────────────────────────────────
+SECTION D — Epigenetic Regulator Profiling
+
+FUNCTION profile_epifactors(adata, de_results):
+
+  STEP 1 — Global Terminal vs Early comparison:
+      LABEL clusters 11, 6, 16  →  "Early"
+      LABEL clusters 10, 8, 13  →  "Terminal"
+      RUN Wilcoxon (Terminal vs Early)
+      FILTER for EPIFACTORS list
+      SORT by logFC descending
+      SAVE  →  epifactors_terminal_vs_early.csv
+
+  STEP 2 — Per-cluster epifactor extraction:
+      FOR each cluster in PATH_CLUSTERS:
+          LOAD cluster DE table
+          FILTER for EPIFACTORS with logFC > 0
+          SAVE  →  cluster_<ID>_epifactors_up.csv
+          RUN Enrichr  (GO_BP + GO_CC) on the epifactor subset
+
+  RETURN terminal-vs-early DataFrame
+
+FUNCTION plot_epifactor_barplot(epi_hits):
+  SELECT top-30 epifactors by logFC
+  DRAW horizontal barplot  (colour = magma gradient by logFC)
+  SAVE  →  terminal_epifactor_logFC.png
+
+FUNCTION plot_epifactor_heatmap(adata):
+  SUBSET adata to PATH_CLUSTERS only
+  FILTER EPIFACTORS to those present in the dataset
+  DRAW scanpy matrixplot:
+      rows    = Leiden clusters (ordered 11→5→16→10→8→13)
+      columns = available epifactors
+      colour  = mean expression (0–1 scaled per gene, magma palette)
+  SAVE  →  Epifactor_RampUp_Heatmap.png
+
+FUNCTION build_epigenetic_trajectory_summary():
+  FOR each cluster in PATH_CLUSTERS:
+      LOAD cluster_<ID>_epifactors_up.csv
+      IF file missing or empty  →  record "None detected"
+      LOAD pre-computed Enrichr GO_BP results
+      EXTRACT top-5 biological process terms
+      APPEND row: {CLUSTER, UPREGULATED_EPIFACTORS, TOP_BIOLOGICAL_PROCESSES}
+  SAVE master table  →  Epigenetic_Trajectory_Summary.tsv
+
+────────────────────────────────────────────
+MAIN (Script 02):
+  LOAD hcm_annotated.h5ad  (output of Script 01)
+
+  [A] CALL run_differential_expression
+      CALL print_terminal_markers
+      CALL plot_path_dotplot
+
+  [B] CALL run_pathway_enrichment
+      FOR each database in [GO_BP, GO_MF]:
+          CALL plot_enrichment_grid
+      CALL export_functional_summary
+
+  [C] CALL run_liana
+      CALL extract_transition_signals  (8 → 13, terminal transition)
+      CALL plot_liana_dotplot
+
+  [D] CALL profile_epifactors
+      CALL plot_epifactor_barplot
+      CALL plot_epifactor_heatmap
+      CALL build_epigenetic_trajectory_summary
+
+  PRINT "All analyses complete"
+
+================================================================================
+END OF PSEUDOCODE
+================================================================================

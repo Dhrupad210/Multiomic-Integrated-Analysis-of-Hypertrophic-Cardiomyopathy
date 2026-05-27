@@ -1,0 +1,601 @@
+# HCM SPATIAL TRANSCRIPTOMICS PIPELINE — PSEUDOCODE
+# ============================================================
+# Comprehensive spatial analysis of Hypertrophic Cardiomyopathy (HCM)
+# tissue using Visium / Spatial Transcriptomics data.
+# ============================================================
+
+# ─────────────────────────────────────────────────────────────
+# 0. DATA LOADING & PREPROCESSING
+# ─────────────────────────────────────────────────────────────
+
+LOAD h5ad_file("STdata_HCM_processed.h5ad") INTO adata
+    adata = (n_cells × n_genes) AnnData matrix
+
+LOAD csv_file("Spatial_coordinates.csv") INTO coords_raw
+    columns: barcode, imagerow, imagecol
+
+SUBSET adata TO intersection(adata.obs_names, coords_raw.index)
+    spatial_coords = coords_raw[imagerow, imagecol] aligned to adata
+
+LOAD csv_file("SCT_expression_matrix.csv") INTO expr_matrix
+    DETECT orientation (genes × barcodes vs barcodes × genes)
+    TRANSPOSE if barcodes are in row index
+    SUBSET columns to adata.obs_names intersection
+
+LOAD auxiliary CSVs:
+    - spatial_QC_metadata.csv
+    - spatial_Cluster_markers.csv
+    - spatial_ATAC_correlated_TFs.csv
+    - spatial_GRN_hub_scores.csv
+    - spatial_marker_cluster.csv
+    - spatial_Cluster_counts.csv
+
+LOAD optional bulk RNA-seq CSVs:
+    - WGCNA_module_summary_GO.csv
+    - ALL_REGULONS.csv
+    - TF_activity_HCM_vs_Control.csv
+    - HCM_gene_panel.csv
+    - limma_significant_DEGs.csv
+
+EXTRACT shared obs arrays:
+    stage        = adata.obs["stage"] (filter INT32_MIN sentinel)
+    pseudotime   = adata.obs["pseudotime"]
+    hcm_score    = adata.obs["HCM_score"]
+    clusters     = adata.obs["seurat_clusters"]
+    csd          = adata.obs["CSD"]
+    vcm_scores   = [vCM_score1..vCM_score5] if present
+
+MAP disease stages to human-readable names:
+    STAGE_MAP = {0:"Compensatory", 1:"Decompensation", 2:"Collapse", ...}
+
+PRECOMPUTE:
+    master_regulator_expr = {GATA6, PPARGC1A, TEAD1, HAND2} from expr_matrix
+    gene_means = expr_matrix.mean(axis=1).sort_values(descending)
+
+# ─────────────────────────────────────────────────────────────
+# SECTION A: UTILITY FUNCTIONS
+# ─────────────────────────────────────────────────────────────
+
+FUNCTION safe_morans_i(coords, values, max_n=600):
+    IF len(coords) > max_n:
+        RANDOMLY subsample to max_n spots
+    COMPUTE pairwise distance matrix dm
+    SET cutoff = 10th percentile of dm[dm > 0]
+    BUILD weights matrix w = 1/dm where 0 < dm ≤ cutoff, else 0
+    ROW-STANDARDISE w
+    RETURN Moran's I = (n / sum(w)) * sum(w * outer(deviations)) / sum(deviations²)
+
+FUNCTION spatial_smoothing(coords, values, sigma=5):
+    CREATE 100×100 regular grid over coord bounding box
+    INTERPOLATE scattered values onto grid using cubic interpolation
+    APPLY Gaussian filter with sigma
+    RETURN (grid_x, grid_y, smoothed_values)
+
+FUNCTION detect_boundaries(coords, values):
+    INTERPOLATE values onto 100×100 grid (cubic)
+    COMPUTE Sobel edge detection (horizontal + vertical gradients)
+    RETURN gradient magnitude
+
+FUNCTION score_module(adata, gene_list, score_name):
+    FILTER gene_list to genes present in adata.var_names
+    CALL scanpy.tl.score_genes(adata, present_genes, score_name)
+    RETURN count of genes used
+
+FUNCTION get_gene(expr_matrix, gene, obs_names):
+    IF gene IN expr_matrix.index:
+        RETURN expr_matrix.loc[gene].reindex(obs_names, fill_value=0)
+    ELSE:
+        RETURN zeros(len(obs_names))
+
+FUNCTION get_genes_mean(expr_matrix, genes, obs_names):
+    avail = [g for g in genes if g IN expr_matrix.index]
+    IF avail is empty: RETURN (None, [])
+    mat = expr_matrix.loc[avail].reindex(columns=obs_names, fill_value=0)
+    RETURN (mat.mean(axis=0), avail)
+
+FUNCTION stage_means_series(values, stage, unique_stages, valid_mask):
+    FOR each stage s IN unique_stages:
+        mask = (stage == s) AND valid_mask
+        IF sum(mask) > 0:
+            RETURN mean(values[mask])
+        ELSE:
+            RETURN NaN
+
+# ─────────────────────────────────────────────────────────────
+# PART 1: CORE SPATIAL ANALYSES (1–15)
+# ─────────────────────────────────────────────────────────────
+
+# ── Analysis 1: QC Metrics Spatial Mapping ────────────────────
+FOR each metric IN ["nCount_Spatial", "nFeature_Spatial"]:
+    values = adata.obs[metric]
+    PLOT spatial scatter: spatial_coords vs values (YlOrRd colormap)
+    COMPUTE Moran's I for spatial autocorrelation
+    COMPUTE coefficient of variation CV = std/mean × 100
+    CLASSIFY pattern: "Clustered" if MI > 0.3, "Random" if |MI| < 0.1, else "Dispersed"
+    IF CV > 50%: FLAG high heterogeneity warning
+SAVE plot: spatial_01_qc_metrics_map.png
+SAVE table: spatial_01_qc_metrics_statistics.csv
+
+# ── Analysis 2: Cluster Spatial Distribution ──────────────────
+PLOT (1) spatial scatter of cluster IDs (tab10 colormap)
+PLOT (2) overlay cluster territories as separate scatter layers
+FOR each cluster_id IN unique(clusters):
+    cells = spatial_coords[clusters == cluster_id]
+    COMPUTE mean pairwise distance md among cluster cells
+    COMPUTE spatial coherence = 1 / (1 + md)
+    GRADE coherence: A (>0.8), B (>0.5), C (>0.3), D (≤0.3)
+SAVE plot: spatial_02_cluster_distribution.png
+SAVE table: spatial_02_cluster_topology.csv
+CORRELATE cell_count vs coherence (Pearson r)
+
+# ── Analysis 3: Stage Progression Spatial Mapping ─────────────
+PLOT (1) spatial scatter of disease stage (RdYlBu_r colormap)
+PLOT (2) spatial scatter of pseudotime (plasma colormap)
+FOR each stage IN unique_stages:
+    COMPUTE mean pseudotime, spatial spread, centroid (row, col)
+SAVE plot: spatial_03_stage_progression_map.png
+SAVE table: spatial_03_stage_transitions.csv
+COMPUTE centroid trajectory:
+    FOR consecutive stage pairs:
+        distance = Euclidean distance between centroids
+        direction = "basal/apical" if Δrow > Δcol else "septal/lateral"
+        LOG displacement and direction
+    IF total path > 100 pixels: FLAG substantial spatial progression
+
+# ── Analysis 4: HCM Score Spatial Gradient ────────────────────
+PLOT (1) raw HCM score spatial distribution (Reds colormap)
+PLOT (2) smoothed HCM score contourf (Gaussian σ=5)
+DEFINE zones by percentiles:
+    Hotspot  = HCM_score > 75th percentile
+    Coldspot = HCM_score < 25th percentile
+    Moderate = remainder
+FOR each zone:
+    COMPUTE Moran's I within zone
+    CLASSIFY hotspot pattern:
+        MI < 0.1  → diffuse/microvascular mechanism (FLAG)
+        MI > 0.3  → focal ischaemic/inflammatory aetiology (FLAG)
+SAVE plot: spatial_04_hcm_score_gradient.png
+SAVE table: spatial_04_hcm_score_zones.csv
+
+# ── Analysis 5: vCM Subtype Spatial Segregation ───────────────
+IF vcm_scores is empty: RAISE error
+FOR each vCM subtype score (vCM1..vCM5):
+    PLOT spatial scatter (coolwarm colormap)
+    COMPUTE Moran's I
+    CLASSIFY pattern
+    FLAG clustered subtypes as "anatomically restricted"
+    IF none clustered: FLAG "diffuse, non-compartmentalised remodelling"
+SAVE plot: spatial_05_vcm_distribution.png
+SAVE table: spatial_05_vcm_distribution.csv
+
+# ── Analysis 6: Master Regulator Spatial Expression ───────────
+FOR each master_regulator IN [GATA6, PPARGC1A, TEAD1, HAND2]:
+    values = mr_expr[regulator]
+    PLOT spatial scatter (viridis, 5th–95th percentile clipping)
+    COMPUTE Moran's I
+    FLAG territorial regulators (|MI| > 0.15)
+SAVE plot: spatial_06_master_regulator_expression.png
+SAVE table: spatial_06_master_regulator_expression.csv
+
+# ── Analysis 7: ETC Complex I Spatial Depletion ───────────────
+etc_genes = [g for g IN expr_matrix.index if g.startswith("NDUF")]
+IF empty: RAISE error
+etc_score = mean expression of etc_genes (or precomputed ETC_score1)
+PLOT (1) ETC score spatial pattern (RdYlGn colormap)
+PLOT (2) scatter: HCM_score vs ETC_score with regression line
+DEFINE metabolic zones by ETC percentiles:
+    Depleted, Moderate, Intact
+FOR each zone:
+    COMPUTE correlation(ETC_score, HCM_score) within zone
+    IF correlation < -0.3: FLAG metabolic crisis
+SAVE plot: spatial_07_etc_complex_depletion.png
+SAVE table: spatial_07_etc_complex_depletion.csv
+
+# ── Analysis 8: UPR Activation Spatial Boundary Detection ─────
+upr_genes = [DDIT3, XBP1, ATF4, HSPA5]
+upr_score = mean expression of available UPR genes
+PLOT (1) UPR score spatial pattern (hot colormap)
+PLOT (2) UPR boundaries via Sobel edge detection on smoothed grid
+PLOT (3) UPR score vs disease stage (scatter + mean stars)
+FOR each stage:
+    COMPUTE mean UPR, std UPR, fraction high-UPR (>75th percentile), Moran's I
+    IF mean UPR increases by >0.1 from previous stage: FLAG ER stress crisis
+SAVE plot: spatial_08_upr_activation_zones.png
+SAVE table: spatial_08_upr_activation_zones.csv
+
+# ── Analysis 9: Contractile Crash Regional Analysis ───────────
+contractile_genes = [MYH6, MYBPC3, MYH7, TNNT2, TPM1]
+contractile_score = mean of available contractile genes
+PLOT (1) spatial scatter of contractile score (RdYlGn)
+PLOT (2) contractile score + stage overlay
+PLOT (3) boxplot of contractile score by stage
+PLOT (4) contractile score vs pseudotime with regression
+FOR each stage:
+    COMPUTE mean, std, fraction silenced (<25th percentile), correlation with pseudotime
+    IF mean < 2.0: FLAG contractile crash
+    IF silenced fraction > 30%: FLAG regional failure
+SAVE plot: spatial_09_contractile_gene_patterns.png
+SAVE table: spatial_09_contractile_gene_patterns.csv
+
+# ── Analysis 10: CSD Spatial Distribution ─────────────────────
+PLOT (1) CSD spatial pattern (YlOrRd)
+PLOT (2) smoothed CSD landscape (contourf)
+PLOT (3) boxplot of CSD by cluster
+FOR each cluster:
+    COMPUTE mean CSD, high-CSD fraction (>75th percentile), Moran's I
+    IF mean CSD > 1.2: FLAG major remodelling programme
+SAVE plot: spatial_10_csd_landscape.png
+SAVE table: spatial_10_csd_landscape.csv
+
+# ── Analysis 11: TF Hub Connectivity Spatial Patterns ─────────
+hub_tfs = grn_hubs["TF"] values
+hub_expr = {tf: get_gene(expr_matrix, tf) for tf in hub_tfs if present}
+IF empty: RAISE error
+PLOT (1) hub TF co-expression correlation heatmap
+PLOT (2) aggregate hub TF expression spatial map (magma)
+FOR each hub TF:
+    COMPUTE Moran's I
+    FETCH connectivity score from grn_hubs
+CORRELATE connectivity vs mean expression (Pearson r)
+    IF r > 0.5 and p < 0.05: FLAG "hub TFs are transcriptionally active"
+    IF r < 0: FLAG "potential network dysregulation"
+SAVE plot: spatial_11_grn_hub_coexpression.png
+SAVE table: spatial_11_grn_hub_coexpression.csv
+
+# ── Analysis 12: ATAC-RNA Correlation Spatial Validation ──────
+atac_tf_list = atac_tfs["TF"] values
+atac_tf_expr = {tf: get_gene(expr_matrix, tf) for tf in atac_tf_list if present}
+IF empty: RAISE error
+PLOT spatial maps for top 6 ATAC TFs (plasma colormap)
+FOR each TF:
+    FETCH ATAC correlation (rho) from atac_tfs table
+    COMPUTE Moran's I
+    COMPUTE correlation with pseudotime
+    FLAG strong ATAC-RNA coupling (rho > 0.5) as "epigenetic drivers"
+SAVE plot: spatial_12_atac_rna_correlation_zones.png
+SAVE table: spatial_12_atac_rna_correlation_zones.csv
+
+# ── Analysis 13: Cluster Marker Spatial Specificity ─────────────
+FOR each cluster IN cluster_markers["cluster"].unique():
+    top_markers = cluster_markers[cluster].sort(avg_log2FC descending).head(10)
+    FOR each marker IN top_markers:
+        IF marker NOT IN expr_matrix: CONTINUE
+        ge = get_gene(marker)
+        in_cluster_mean  = mean(ge[clusters == cluster])
+        out_cluster_mean = mean(ge[clusters != cluster])
+        specificity = in_cluster_mean / (in_cluster_mean + out_cluster_mean)
+        spatial_precision = Moran's I within cluster
+        APPEND to results
+PLOT spatial maps for top marker of first 4 clusters
+SAVE plot: spatial_13_marker_specificity_spatial.png
+SAVE table: spatial_13_marker_specificity_scores.csv
+FLAG highly specific markers (>0.8) and low-specificity markers (<0.6)
+
+# ── Analysis 14: Multi-Scale Spatial Neighborhood Analysis ────
+FOR k IN [10, 20, 50]:
+    BUILD k-NN graph on spatial_coords (ball_tree)
+    FOR each cell i:
+        neighbors = k nearest spatial neighbors (excluding self)
+        COMPUTE neighbor mean HCM score, neighbor HCM heterogeneity (std)
+        COMPUTE fraction of neighbors per disease stage
+        CLASSIFY microenvironment:
+            IF max(stage_fraction) > 0.7: "Homogeneous_S{stage}"
+            ELSE: "Mixed"
+        APPEND to neighborhood_df
+PLOT (1) neighborhood heterogeneity spatial map (k=20)
+PLOT (2) microenvironment type spatial map (colored by type)
+SAVE plot: spatial_14_neighborhood_analysis.png
+SAVE table: spatial_14_microenvironment_communities.csv
+FLAG high-heterogeneity neighborhoods (>90th percentile) as "active remodelling fronts"
+
+# ── Analysis 15: Predictive Spatial Risk Mapping ────────────────
+BUILD feature matrix X:
+    HCM_score, CSD, pseudotime, stage
+    TF_{GATA6, PPARGC1A, TEAD1, HAND2}
+    ETC_score, UPR_score, Contractile_score (if computed)
+    vCM1..vCM5 scores
+    Neighbor_Mean_HCM, Neighbor_Heterogeneity (from k=20 analysis)
+    FILLNA(0)
+
+SPLIT: train_test_split(X, y=HCM_score, test_size=0.3, random_state=42)
+FIT RandomForestRegressor(n_estimators=100, max_depth=10)
+PREDICT on full dataset
+EVALUATE: Train R², Test R², Train RMSE, Test RMSE
+COMPUTE feature importances → rank features
+
+DEFINE priority zones:
+    Zone 3 (High risk/Reliable):   pred > 75th pct AND error < 75th pct
+    Zone 2 (High risk/Uncertain):  pred > 75th pct AND error ≥ 75th pct
+    Zone 1 (Low risk/Uncertain):   pred ≤ 75th pct AND error ≥ 75th pct
+    Zone 0 (Low risk/Reliable):   pred ≤ 75th pct AND error < 75th pct
+
+PLOT (1) predicted risk spatial map
+PLOT (2) prediction error spatial map
+PLOT (3) top 15 feature importance bar chart
+PLOT (4) therapeutic priority zone map (RdYlGn_r)
+SAVE plot: spatial_15_risk_prediction_model.png
+SAVE table: spatial_15_risk_prediction_model.csv
+SAVE table: spatial_15_risk_feature_importance.csv
+FLAG Zone 3 cells as "priority intervention targets"
+
+
+# ─────────────────────────────────────────────────────────────
+# PART 2: BULK RNA-SEQ INTEGRATION (BulkVal 1–7)
+# ─────────────────────────────────────────────────────────────
+
+# ── BulkVal 1: WGCNA Module Scores Spatial Distribution ─────
+IF WGCNA data available:
+    FOR each module IN WGCNA table:
+        genes = split(Top50_Genes column by comma)
+        score_module(adata, genes, "WGCNA_M{module_id}")
+    PLOT spatial maps for top 9 modules
+    PLOT stage trajectory (mean module score per stage)
+    SAVE plots and scores CSV
+
+# ── BulkVal 2: Regulon Scores Spatial Validation ──────────────
+IF regulon data available:
+    FOR each regulon column IN ALL_REGULONS.csv:
+        genes = non-null entries in column
+        IF len(genes) > 10:
+            score_module(adata, genes, "REG_{regulon_name}")
+    PLOT spatial maps for all regulons
+    PLOT stage trajectory for all regulons
+    PLOT cross-regulon correlation heatmap
+    SAVE plots and scores CSV
+
+# ── BulkVal 3: TF Activity Spatial Validation ──────────────────
+IF TF_activity data available:
+    top_active    = TFs with adj.P.Val < 0.05 AND logFC > 0, top 15 by logFC
+    top_repressed = TFs with adj.P.Val < 0.05 AND logFC < 0, bottom 15 by logFC
+    PLOT spatial maps for top active TFs (Reds)
+    PLOT spatial maps for top repressed TFs (Blues_r)
+    FOR each TF: COMPUTE Moran's I, correlation with HCM_score
+    SAVE TF-HCM correlation table and expression matrix
+
+# ── BulkVal 4: HCM Gene Panel Spatial Validation ───────────────
+IF HCM_panel data available:
+    top_up   = significant genes (adj.P.Val < 0.05, logFC > 0), top 12
+    top_down = significant genes (adj.P.Val < 0.05, logFC < 0), bottom 12
+    PLOT heatmap: top panel genes sorted by pseudotime (Z-score)
+    PLOT spatial maps for top 6 genes (3 up, 3 down)
+    FOR each gene: COMPUTE Moran's I, annotate with bulk logFC
+
+# ── BulkVal 5: Bulk DEG Spatial Validation ────────────────────
+IF bulk_degs data available:
+    top_up_bulk   = significant DEGs (logFC > 0), top 25
+    top_down_bulk = significant DEGs (logFC < 0), bottom 25
+    up_present   = intersection with spatial genes
+    down_present = intersection with spatial genes
+    score_module(adata, up_present,   "Bulk_UP_signature")
+    score_module(adata, down_present, "Bulk_DOWN_signature")
+    PLOT spatial maps of UP and DOWN signatures
+    PLOT stage trajectory of both signatures
+    SAVE signature scores CSV
+
+# ── BulkVal 6: Bulk vs Spatial Correlation Analysis ───────────
+IF bulk_degs available:
+    FOR first 200 bulk DEG symbols:
+        IF gene IN spatial matrix:
+            COMPUTE Spearman r(gene_expr, pseudotime)
+            COMPUTE Spearman r(gene_expr, stage)
+    MERGE with bulk logFC table
+    PLOT scatter: bulk logFC vs spatial pseudotime correlation
+        COLOR: red if |spatial_r| > 0.3 AND |logFC| > 0.5
+               blue if |spatial_r| > 0.3
+               grey otherwise
+    ANNOTATE top 15 genes by spatial correlation
+    COMPUTE overall Pearson r(bulk_logFC, spatial_r)
+    IF r < 0.2: FLAG poor bulk-spatial agreement
+
+# ── BulkVal 7: Disease Progression Validation ─────────────────
+    signature_cols = adata.obs columns starting with WGCNA_M, REG_, or Bulk_
+    FOR each signature:
+        GROUP cells by stage → Kruskal-Wallis test
+        RECORD H-statistic, p-value, significance (p < 0.05)
+    SAVE ANOVA results
+    REPORT percentage of signatures with significant stage variation
+
+
+# ─────────────────────────────────────────────────────────────
+# PART 3: EXTENSION ANALYSES (EXT 1–8)
+# ─────────────────────────────────────────────────────────────
+
+# ── EXT1: Spatially Variable Genes ──────────────────────────
+TEST top 500 expressed genes:
+    FOR each gene:
+        IF std == 0: SKIP
+        COMPUTE Moran's I
+        APPEND {Gene, MoransI, MeanExpr}
+SORT by Moran's I descending
+PLOT spatial maps for top 12 SVGs
+PLOT histogram of Moran's I distribution (threshold = 0.10)
+SAVE table: spatially_variable_genes.csv
+
+# ── EXT2: Metabolic State Spatial Mapping ─────────────────────
+DEFINE gene modules:
+    FAO:        [PPARA, CPT1A, CPT1B, CPT2, ACADL, ACADM, ...]
+    Glycolysis: [HK1, HK2, PFKM, ALDOA, GAPDH, PKM, LDHA, ...]
+    OXPHOS:     [NDUFA1, SDHB, UQCRB, COX4I1, ATP5F1A, ...]
+    Ketone:     [BDH1, OXCT1, HMGCS2, ACAT1, ACAT2]
+FOR each module: score_module(adata, genes, "Metab_{name}")
+COMPUTE FAO/Glycolysis ratio = Metab_FAO - Metab_Glycolysis
+PLOT spatial maps for all 4 metabolic scores + ratio
+PLOT stage trajectory for all metabolic programmes
+SAVE metabolic scores CSV
+
+# ── EXT3: Fibrosis / ECM Spatial Gradient ────────────────────
+DEFINE gene modules:
+    Fibrosis:       [COL1A1, COL1A2, COL3A1, FN1, POSTN, TGFB1, CTGF, MMP2, ...]
+    Myofibroblast:  [ACTA2, TAGLN, CNN1, MYH11, PDGFRA, PDGFRB]
+    Anti-fibrosis:  [SMAD7, BMP7, HGF, KGF, PTEN, KLOTHO]
+score_module for each
+COMPUTE Net_fibrosis = Fibrosis_score - AntiFibrosis_score
+DEFINE fibrosis hotspots (>90th percentile)
+PLOT spatial maps for fibrosis, myofibroblast, anti-fibrosis, net fibrosis
+REPORT hotspot percentage by stage
+CORRELATE fibrosis vs contractile score
+SAVE fibrosis scores CSV
+
+# ── EXT4: Proximity-Based Ligand-Receptor Hotspots ────────────
+DEFINE cardiac LR pairs:
+    (TGFB1, TGFBR1), (TGFB1, TGFBR2), (ANGPT2, TEK), (EDN1, EDNRA),
+    (NRG1, ERBB4), (IGF1, IGF1R), (VEGFA, KDR), (PDGFB, PDGFRB),
+    (FGF2, FGFR1), (WNT5A, FZD2), (BMP2, BMPR2), (ADM, CALCRL)
+BUILD k=10 NN graph on spatial_coords
+FOR each valid LR pair (both genes expressed):
+    ligand_expr = get_gene(ligand)
+    receptor_expr = get_gene(receptor)
+    receptor_neighbor = mean receptor expression in k neighbors
+    lr_score = ligand_expr × receptor_neighbor
+SORT pairs by mean lr_score
+PLOT spatial maps for top 6 LR pairs
+PLOT cluster heatmap of mean LR score per cluster
+SAVE LR scores CSV
+
+# ── EXT5: Cardiac Stress Response Zones ────────────────────────
+DEFINE gene modules:
+    HSP:        [HSPA1A, HSPA5, HSPB1, HSP90AA1, DNAJB1, BAG3, ...]
+    Autophagy:  [BECN1, ATG5, ATG7, SQSTM1, MAP1LC3B, BNIP3, PINK1, ...]
+    ISR:        [ATF4, ATF3, ATF6, DDIT3, SLC7A11, EIF2AK1, ...]
+    Proteasome: [PSMA1, PSMB1, PSMD1, UBA52, UBB, UCHL1, ...]
+FOR each module: score_module(adata, genes, "Stress_{name}")
+COMPUTE combined stress PC1 = PCA(n=1) on z-scaled [HSP, Autophagy, ISR, Proteasome]
+PLOT spatial maps for all 5 stress scores
+PLOT stage trajectory for all stress programmes
+CORRELATE stress PC1 with HCM_score
+SAVE stress scores CSV
+
+# ── EXT6: Transmural / Radial Gradient Analysis ───────────────
+COMPUTE centroid = mean(spatial_coords)
+COMPUTE radial_distance = Euclidean distance from centroid per cell
+NORMALISE radial_distance to [0, 1]
+DEFINE radial zones by ternary cut: Core (0–0.33), Mid (0.33–0.66), Periphery (0.66–1)
+PLOT (1) radial distance spatial map
+PLOT (2) HCM score reference map
+PLOT (3) radial zone categorical map
+COMPUTE Spearman r(gene_expr, radial_distance) for top 500 genes
+    REPORT top centrifugal (r > 0) and centripetal (r < 0) genes
+PLOT violin plots of HCM_score, stress PC1, FAO/glycolysis ratio by radial zone
+SAVE radial metadata and gene correlations CSV
+
+# ── EXT7: Immune & Inflammatory Infiltration Map ──────────────
+DEFINE gene modules:
+    Innate:       [ITGAM, CD68, CD14, CSF1R, LYZ, S100A8, TYROBP, ...]
+    Adaptive:     [CD3D, CD3E, CD4, CD8A, FOXP3, GZMB, PRF1, CD19, ...]
+    Inflammasome: [NLRP3, PYCARD, CASP1, IL1B, IL18, GSDMD, HMGB1, ...]
+    Complement:   [C1QA, C1QB, C3, C4A, CFB, CFH, C5AR1, ...]
+FOR each module: score_module(adata, genes, "Immune_{name}")
+COMPUTE Immune_total = Innate + Adaptive + Inflammasome
+DEFINE immune hotspots (>95th percentile of Immune_total)
+PLOT spatial maps for all 5 immune scores
+REPORT hotspot percentage by stage
+CORRELATE Immune_total with Fibrosis_score
+SAVE immune scores CSV
+
+# ── EXT8: Sarcomere Organisation Index ────────────────────────
+DEFINE sarcomere component modules:
+    Thick_filament:  [MYH6, MYH7, MYL2, MYL3, MYL4, ...]
+    Thin_filament:   [ACTC1, TNNT2, TNNI3, TPM1, TMOD1, ...]
+    Z_disc:          [ACTN2, LDB3, CSRP3, MYOZ2, TTN, ...]
+    Titin_elastic:   [TTN, FHL2, MYPN, MYOM1, MYOM2]
+    Calcium:         [ATP2A2, PLN, CASQ2, RYR2, CACNA1C, ...]
+FOR each component: score_module(adata, genes, "Sarc_{comp}")
+COMPUTE Sarc_total = mean of all component scores
+BUILD k=8 NN graph
+COMPUTE local_mean and local_std of Sarc_total in neighbors
+COMPUTE local_CV = local_std / local_mean
+COMPUTE Sarc_local_coherence = 1 - local_CV
+COMPUTE Sarc_disarray_index = local_CV
+PLOT spatial maps for 5 components + total + disarray + coherence
+PLOT stage trajectory for sarcomere scores
+CORRELATE disarray index with HCM_score
+SAVE sarcomere scores CSV
+
+
+# ─────────────────────────────────────────────────────────────
+# PART 4: FOLLOW-UP ANALYSES (FU 1–3)
+# ─────────────────────────────────────────────────────────────
+
+# ── FU1: Fibrosis–Contractile Spatial Antagonism ──────────────
+contractile_genes = [MYH6, MYH7, TNNT2, TNNI3, TPM1, ACTC1, MYL2, MYL3, MYBPC3, TTN]
+IF "Contractile_score" NOT IN adata.obs:
+    score_module(adata, contractile_genes, "Contractile_score")
+Z-normalise Fibrosis_score and Contractile_score
+DEFINE cell states by ±0.5 SD thresholds:
+    Fibrotic_lost:      fib_z > 0.5 AND cont_z < -0.5
+    Contractile_intact: fib_z < -0.5 AND cont_z > 0.5
+    Transitional:       fib_z > 0.5 AND cont_z > 0.5
+    Depleted:           fib_z < -0.5 AND cont_z < -0.5
+    Mixed:              otherwise
+PLOT (1) spatial map of 5 FC states (colored)
+PLOT (2) fibrosis Z-score spatial map
+PLOT (3) contractile Z-score spatial map
+COMPUTE stage composition stacked bar chart (% per state)
+SAVE FC states CSV
+REPORT % Fibrotic_lost per stage
+
+# ── FU2: Border-Zone Analysis (Fibrosis-Immune Interface) ─────
+DEFINE:
+    fibrosis_core = Fibrosis_score > 75th percentile
+    immune_zone   = Immune_total > 75th percentile
+COMPUTE NN distance radius = 3 × 10th percentile of 1-NN distances
+COMPUTE distance matrix between all cells
+DEFINE:
+    near_fib = any cell within radius of a fibrosis_core cell
+    near_imm = any cell within radius of an immune_zone cell
+    border_zone = near_fib AND near_imm AND NOT core AND NOT immune
+PLOT spatial map: fibrosis core (red), immune zone (blue), border (orange), other (grey)
+IF border cells > 5:
+    COMPUTE mean expression of top 300 genes in border vs core vs immune
+    COMPUTE border enrichment FC = mean_border / mean(core+immune)
+    PLOT heatmap of top 20 border-enriched genes (Z-score)
+    SAVE border zone gene table
+SAVE zone labels CSV
+
+# ── FU3: Foetal Gene Re-expression Programme ──────────────────
+DEFINE:
+    FGP_UP   = [MYH7, TNNI1, ACTC1, ACTA1, NPPB, NPPA, MYL4, MYL7, XIRP1, ANKRD1, CITED4]
+    FGP_DOWN = [MYH6, TNNI3, ATP2A2, PLN, S100A1, CASQ2, MYL2]
+score_module(adata, FGP_UP,   "FGP_up")
+score_module(adata, FGP_DOWN, "FGP_down")
+COMPUTE FGP_index = FGP_up - FGP_down
+PLOT spatial maps for FGP_up, FGP_down, FGP_index
+PLOT stage trajectory with SEM bands for all 3 scores
+CORRELATE FGP_index with:
+    Fibrosis_score, Immune_total, Radial_norm, HCM_score, Stress_combined_PC1
+PLOT correlation bar chart (red=positive, blue=negative, *=significant)
+IF Radial_zone available:
+    REPORT FGP_index by radial zone (Core, Mid, Periphery)
+SAVE FGP scores CSV
+
+
+# ─────────────────────────────────────────────────────────────
+# PART 5: SYNTHESIS FIGURE
+# ─────────────────────────────────────────────────────────────
+
+GUARD: verify required obs columns exist [FGP_index, FC_state, Interface_zone, Fibrosis_score, HCM_score]
+
+CREATE 3×4 grid figure (22×18 inches):
+    Panel A (row 0, col 0):   FGP spatial map (RdBu_r, MI annotated)
+    Panel B (row 0, col 1):   FC state spatial map (5 colors, legend)
+    Panel C (row 0, col 2):   Border zone spatial map (4 colors, legend)
+    Panel D (row 0, col 3):   Stacked bar — state composition per stage
+    Panel E (row 1, col 0-1): FGP trajectory with SEM (foetal ↑, adult ↓, net index)
+    Panel F (row 1, col 2-3): FGP vs HCM scatter by stage + regression line
+    Panel G (row 2, col 0-1): FGP box plots by radial zone (Core→Periphery)
+    Panel H (row 2, col 2-3): Summary schematic (concentric circles: Core=Adult/FGP-/Contractile, Periphery=Foetal/FGP+/Fibrotic)
+
+SAVE synthesis figure: spatial_SYNTHESIS_integrated_model.png
+SAVE supplementary stats CSV: FGP_index correlations with spatial features
+
+
+# ─────────────────────────────────────────────────────────────
+# PART 6: FILE CHECKLIST & LOGGING
+# ─────────────────────────────────────────────────────────────
+
+DEFINE EXPECTED_FILES = [list of ~80 PNG and CSV filenames]
+FOR each expected file:
+    CHECK os.path.exists()
+    REPORT status (OK / MISSING)
+COMPUTE and REPORT fraction present
+WRITE full execution log to spatial_pipeline_log.txt

@@ -1,0 +1,540 @@
+## ============================================================
+## HCM BULK RNA-SEQ PIPELINE v4 — PSEUDOCODE
+## GSE141910 (n=366: 183 HCM / 183 Control)
+## ============================================================
+
+## ── 0. INITIALIZATION ─────────────────────────────────────
+LOAD required libraries (data.table, limma, ggplot2, ggrepel, fgsea, msigdbr, 
+                       AnnotationDbi, org.Hs.eg.db, clusterProfiler, 
+                       ComplexHeatmap, circlize, decoupleR, dorothea, WGCNA)
+SET global options (stringsAsFactors = FALSE)
+CREATE output directories: outputs/plots, outputs/tables, outputs/regulons
+DEFINE helper functions:
+    banner(n, title)         → print formatted step header
+    save_png(plot, filename) → write PNG to outputs/plots
+    save_csv(df, filename)   → write CSV to outputs/tables
+    save_txt(genes, filename)→ write gene list to outputs/regulons
+
+## ============================================================
+## STEP 1: MERGE RAW COUNT FILES
+## ============================================================
+FIND all files matching pattern "*.csv.gz" in working directory
+IF no files found: STOP with error
+
+FOR each file:
+    READ CSV, keep only first two columns (GeneID, counts)
+    STORE in list
+
+EXTRACT common gene list from first file
+FOR each count matrix in list:
+    ALIGN rows to common gene list (reorder/match)
+    EXTRACT count column
+
+COMBINE into final_matrix:
+    Column 1 = GeneID
+    Columns 2..N = count columns from each sample
+REPLACE any NA values with 0
+WRITE "outputs/tables/GSE141910_raw_counts_merged.csv"
+REPORT dimensions: n_genes × n_samples
+
+## ============================================================
+## STEP 2: PREPARE COUNTS AND METADATA
+## ============================================================
+CONVERT final_matrix to data frame
+SET rownames = GeneID column
+REMOVE GeneID column
+
+FOR each sample name in column names:
+    IF contains "_C" → label "Control"
+    ELSE IF contains "_P" → label "HCM"
+    ELSE → STOP with error
+
+CREATE coldata data frame:
+    rownames = sample names
+    condition = factor("Control"/"HCM", levels = c("Control","HCM"))
+VERIFY no NA conditions exist
+REPORT: n_Control, n_HCM
+
+## ============================================================
+## STEP 3: PCA QUALITY CHECK
+## ============================================================
+TRANSPOSE counts matrix → samples × genes
+RUN prcomp() with scale. = TRUE
+CALCULATE % variance explained: 100 × sdev² / sum(sdev²)
+
+CREATE pca_df:
+    PC1 = pca$x[,1], PC2 = pca$x[,2]
+    condition = coldata$condition
+    sample = rownames(coldata)
+
+PLOT scatter: PC1 vs PC2, colored by condition
+    ADD 90% confidence ellipses (dashed)
+    SET colors: Control = steelblue, HCM = firebrick
+    LABEL axes with % variance
+SAVE as "01_PCA.png"
+
+## ============================================================
+## STEP 4: DIFFERENTIAL EXPRESSION (limma)
+## ============================================================
+CREATE design matrix: ~ condition (intercept + HCM coefficient)
+FIT linear model: lmFit(counts, design)
+APPLY empirical Bayes shrinkage: eBayes(fit)
+EXTRACT results: topTable(coef = "conditionHCM", number = Inf)
+
+ANNOTATE genes:
+    STRIP version suffix from ENSEMBL IDs (sub "\..*", "")
+    MAP ENSEMBL → SYMBOL via mapIds(org.Hs.eg.db)
+    FALLBACK to original GeneID if mapping fails
+
+FLAG significant: adj.P.Val < 0.05 AND abs(logFC) > 1
+CLASSIFY direction: Up (logFC > 0) or Down (logFC < 0)
+REPORT: total DEGs, n_up, n_down
+SAVE full results → "limma_full_results.csv"
+SAVE significant subset → "limma_significant_DEGs.csv"
+
+── Volcano Plot ──
+SELECT top 25 significant genes (lowest adj.P.Val)
+PLOT:
+    ALL points colored by significance (grey = NS, red = sig)
+    LABEL top 25 with gene symbols (geom_text_repel)
+    THRESHOLD lines: vertical at |logFC| = 1, horizontal at adj.P = 0.05
+SAVE as "02_Volcano.png"
+
+## ============================================================
+## STEP 5: HEATMAP — TOP 50 DEGs
+## ============================================================
+SELECT top 25 UP-regulated: logFC > 0, adj.P < 0.05, sort by adj.P
+SELECT top 25 DOWN-regulated: logFC < 0, adj.P < 0.05, sort by adj.P
+COMBINE → top50 list
+
+EXTRACT expression submatrix for top50 genes
+Z-SCORE normalize per gene (row): scale()
+CLIP extreme values to [-3, 3]
+
+MAP row labels to gene symbols (match clean_GeneID)
+DEFINE column annotation (HeatmapAnnotation):
+    Condition: Control = steelblue, HCM = firebrick
+DEFINE row annotation (rowAnnotation):
+    Direction: Up = firebrick, Down = steelblue
+
+DRAW clustered heatmap (ComplexHeatmap):
+    Color scale: steelblue → white → firebrick
+    Cluster rows and columns
+    Hide column names
+SAVE as "03_Heatmap_top50_DEGs.png"
+
+## ============================================================
+## STEP 6: GSEA — HALLMARK + C2 (fgsea)
+## ============================================================
+CREATE ranked vector: names = clean_GeneID, values = t-statistic
+SORT descending
+REMOVE duplicate gene IDs (keep first = highest |t|)
+
+FETCH gene sets from MSigDB:
+    HALLMARK (collection "H")
+    C2 (collection "C2")
+SPLIT into named list: pathway_name → vector of ENSEMBL genes
+
+FOR each collection (Hallmark, C2):
+    RUN fgsea(pathways, ranked, minSize=15, maxSize=500, nPermSimple=10000)
+    FILTER significant: padj < 0.05
+    FLATTEN leadingEdge vectors to semicolon-separated strings
+    SAVE as CSV
+
+── GSEA Barplot ──
+SELECT top 25 Hallmark pathways by abs(NES)
+CLEAN pathway names: remove "HALLMARK_", replace "_" with " "
+PLOT horizontal bars:
+    x = NES, fill = direction (red = up in HCM, blue = down)
+SAVE as "04_GSEA_Hallmark_barplot.png"
+
+── Enrichment Curve ──
+IDENTIFY top pathway: max(abs(NES))
+PLOT enrichment curve using plotEnrichment()
+SAVE as "04b_GSEA_enrichment_<pathway_name>.png"
+
+## ============================================================
+## STEP 7: TF ACTIVITY — decoupleR + DoRothEA
+## ============================================================
+BUILD symbol-mapped expression matrix:
+    STRIP version suffix from ENSEMBL rownames
+    MAP to symbols via sym_map (from DE results)
+    REMOVE unmapped genes and duplicate symbols
+    KEEP first occurrence of each symbol
+
+LOAD DoRothEA regulons (dorothea_hs):
+    FILTER confidence in c("A", "B", "C")
+    RENAME tf → source
+    SELECT columns: source, target, mor
+
+CHECK overlap: n targets in expression matrix / total unique targets
+RUN run_ulm() (Univariate Linear Model):
+    mat = expr_sym, net = regulon
+    .source = "source", .target = "target", .mor = "mor"
+    minsize = 4
+
+RESHAPE results to wide matrix (TFs × samples):
+    FILTER statistic == "ulm"
+    PIVOT wider: id_cols = source, names_from = condition, values_from = score
+    CONVERT to matrix, set rownames = TF names
+
+── Differential TF Activity ──
+DEFINE condition vector from column names (_C = Control, _P = HCM)
+CREATE design matrix: ~ cond_tf
+RUN limma: lmFit(tf_mat, des_tf) → eBayes()
+EXTRACT topTable(coef = "cond_tfHCM")
+SAVE as "TF_activity_HCM_vs_Control.csv"
+
+── TF Lollipop ──
+SELECT significant TFs: adj.P.Val < 0.05
+SORT by abs(t), keep top 40
+SORT by logFC for plotting
+PLOT horizontal lollipop:
+    x = TF (reordered by logFC), y = logFC
+    SEGMENTS from 0 to logFC
+    COLOR: red = active in HCM (logFC > 0), blue = repressed
+SAVE as "05_TF_activity_lollipop.png"
+
+── TF Volcano ──
+LABEL TFs where adj.P < 0.05 AND abs(logFC) > 0.3
+PLOT: logFC vs -log10(adj.P.Val), colored by significance
+SAVE as "05b_TF_activity_volcano.png"
+
+## ============================================================
+## STEP 8: WGCNA — SIGNED HYBRID (power=4, 5k genes)
+## ============================================================
+ENABLE WGCNA multithreading (min(8, detectCores()))
+
+REMOVE erythrocyte genes:
+    DEFINE erythrocyte symbols list (HBA1, HBA2, HBB, etc.)
+    MAP to ENSEMBL IDs
+    EXCLUDE from expression matrix
+
+SELECT top 5000 most variable genes (by row variance)
+TRANSPOSE: datExpr0 = samples × genes
+RUN goodSamplesGenes(datExpr0) → filter bad samples/genes
+
+SET softPower = 4 (pre-calibrated, R² = 0.99)
+PIN WGCNA::cor to avoid Bioconductor namespace conflicts
+
+RUN blockwiseModules():
+    power = 4
+    TOMType = "signed"
+    networkType = "signed hybrid"
+    minModuleSize = 30
+    reassignThreshold = 0
+    mergeCutHeight = 0.25
+    numericLabels = TRUE
+    pamRespectsDendro = FALSE
+    saveTOMs = FALSE
+RESTORE stats::cor
+
+REPORT n_modules detected
+CALCULATE module eigengenes (MEs)
+
+── Module-Trait Correlation ──
+DEFINE trait: cond_num = as.numeric(grepl("_P", rownames(datExpr)))
+CALCULATE cor(MEs, cond_num) → mod_cor
+CALCULATE p-values: corPvalueStudent()
+ADJUST p-values: p.adjust(method = "BH")
+CREATE summary table: Module, Correlation, Pvalue, Padj
+SORT by Pvalue
+SAVE as "WGCNA_module_HCM_correlation.csv"
+REPORT top module: name, correlation
+
+── kME (Hub Gene Membership) ──
+PIN WGCNA::cor
+CALCULATE signedKME(datExpr, MEs)
+RESTORE stats::cor
+
+EXTRACT gene tables per module:
+    FOR each unique module color:
+        GET genes in module
+        GET kME values
+        MERGE with DE results (Symbol, logFC, adj.P.Val, significant)
+        SORT by abs(kME) descending
+SAVE combined as "WGCNA_all_module_genes.csv"
+
+── Module Heatmap ──
+PLOT labeledHeatmap of mod_cor
+    Colors = blueWhiteRed(50)
+    zlim = [-1, 1]
+SAVE as "06_WGCNA_module_heatmap.png"
+
+── Top Module GO Enrichment ──
+IDENTIFY top module (lowest Padj)
+EXTRACT gene symbols from top module
+RUN enrichGO():
+    OrgDb = org.Hs.eg.db, keyType = "SYMBOL"
+    ont = "BP", pAdjustMethod = "BH"
+    pvalueCutoff = 0.05, qvalueCutoff = 0.2
+IF results exist:
+    SAVE as "WGCNA_top_module_GO_BP.csv"
+    PLOT dotplot (top 20 terms)
+    SAVE as "06b_WGCNA_top_module_GO.png"
+
+## ============================================================
+## STEP 9: KNOWN HCM GENE PANEL CHECK
+## ============================================================
+DEFINE curated HCM gene list:
+    Thick filament: MYH7, MYH6, MYBPC3, MYL2, MYL3
+    Thin filament: TNNT2, TNNI3, TNNI1, TNNC1, TPM1, ACTC1
+    Giant/Z-disc: TTN, ACTN2, CSRP3, FHL1, ANKRD1
+    Ca²⁺ handling: PLN, RYR2, CASQ2, ATP2A2
+    Hypertrophy TFs: MEF2A, MEF2C, MEF2D, GATA4, NFATC1
+    Natriuretic peptides: NPPA, NPPB
+    Fibrosis: COL1A1, COL3A1, POSTN, CCN2
+    Wnt: SFRP4, FRZB, WNT5A, WNT9A
+    Metabolic: PDK4, LDHA, HK2, KLF15
+
+EXTRACT DE results for panel genes
+SORT by logFC descending
+SAVE as "HCM_gene_panel.csv"
+
+PLOT lollipop:
+    x = Symbol (reordered by logFC), y = logFC
+    COLOR/SIZE by significance (red = sig, grey = NS)
+    THRESHOLD lines at logFC = -1, 0, 1
+SAVE as "07_HCM_panel_lollipop.png"
+
+## ============================================================
+## STEP 10: ATAC INTEGRATION (Conditional)
+## ============================================================
+CHECK if "atac_scores.tab" exists
+IF NOT present:
+    MESSAGE "skipping ATAC step"
+    SET atac_res = NULL
+    SKIP to Step 11
+
+IF present:
+    LOAD ATAC data
+    CLEAN column names (remove #, ', whitespace)
+    RENAME to: chr, start, end, ATAC_DCM, ATAC_NF
+    FORMAT chr: prepend "chr" if missing
+
+    CALCULATE:
+        delta_atac = ATAC_DCM - ATAC_NF
+        mean_atac = (ATAC_DCM + ATAC_NF) / 2
+
+    FILTER: mean_atac > 0
+    DEFINE thresholds:
+        open_th = 90th percentile of delta_atac
+        clos_th = 10th percentile of delta_atac
+
+    SUBSET:
+        open_dcm = delta_atac >= open_th
+        clos_dcm = delta_atac <= clos_th
+
+    CONVERT to GRanges objects (make_gr function)
+
+    LOAD JASPAR2022 PWMs:
+        collection = "CORE", tax_group = "vertebrates"
+
+    MATCH motifs:
+        mot_open = matchMotifs(pwm_list, gr_open, genome = hg38)
+        mot_clos = matchMotifs(pwm_list, gr_clos, genome = hg38)
+        mot_bg = matchMotifs(pwm_list, gr_bg, genome = hg38)
+
+    FOR each comparison (open vs bg, closed vs bg):
+        FOR each PWM:
+            COUNT matches in foreground and background
+            RUN Fisher's exact test (alternative = "greater")
+            STORE: Motif name, OR, Pvalue
+        ADJUST p-values: p.adjust(method = "BH")
+        SORT by Padj
+
+    SAVE:
+        "ATAC_motif_open_DCM.csv"
+        "ATAC_motif_closed_DCM.csv"
+    SET atac_res = list(open, closed)
+
+## ============================================================
+## STEP 11: BUILD REGULON MODULES
+## ============================================================
+EXTRACT significant DEGs: sig_df = res[significant == TRUE]
+
+IDENTIFY:
+    active_tfs_up = TFs with adj.P < 0.05 AND logFC > 0
+    active_tfs_dn = TFs with adj.P < 0.05 AND logFC < 0
+
+GET targets from DoRothEA:
+    targets_of_up_tfs = targets where tf in active_tfs_up
+    targets_of_dn_tfs = targets where tf in active_tfs_dn
+
+DEFINE DEG sets:
+    up_degs = sig_df symbols where logFC > 0
+    dn_degs = sig_df symbols where logFC < 0
+
+IF ATAC data available:
+    open_tfs = motifs where Padj < 0.05 in open results
+    closed_tfs = motifs where Padj < 0.05 in closed results
+
+    REG1 = up_degs ∩ targets_of_up_tfs ∩ targets of open_tfs
+    REG3 = dn_degs ∩ targets_of_dn_tfs ∩ targets of open_tfs
+    REG4 = dn_degs ∩ targets_of_dn_tfs ∩ targets of closed_tfs
+ELSE:
+    REG1 = up_degs ∩ targets_of_up_tfs
+    REG3 = dn_degs ∩ targets_of_dn_tfs
+    REG4 = empty character vector
+
+REG2 = up_degs NOT in targets_of_up_tfs
+REG5 = WGCNA top module genes where kME > 0.7
+
+── Fallback ──
+IF length(REG1) < 10: REG1 = up_degs ∩ targets_of_up_tfs
+IF length(REG3) < 10: REG3 = dn_degs ∩ targets_of_dn_tfs
+
+── Remove Overlaps (Priority: REG1 > REG2 > REG3 > REG4 > REG5) ──
+REG2 = REG2 \ REG1
+REG3 = REG3 \ (REG1 ∪ REG2)
+REG4 = REG4 \ (REG1 ∪ REG2 ∪ REG3)
+REG5 = REG5 \ (REG1 ∪ REG2 ∪ REG3 ∪ REG4)
+
+── Report ──
+PRINT summary table with sizes for all 5 regulons
+
+── Save ──
+SAVE each regulon as .txt gene list
+SAVE combined as "ALL_REGULONS.csv" (padded with NA to equal lengths)
+
+── Regulon Size Plot ──
+CREATE data frame: Regulon, N, Direction
+PLOT bar chart with labels
+    Fill: Up = firebrick, Down = steelblue, Mixed = darkorchid4
+SAVE as "08_Regulon_sizes.png"
+
+── Regulon Heatmap ──
+SELECT top 20 REG1 + top 20 REG3 genes
+MAP symbols back to ENSEMBL
+EXTRACT expression submatrix
+Z-score normalize, clip to [-3, 3]
+DEFINE annotations: Condition (columns), Regulon (rows)
+DRAW heatmap
+SAVE as "09_Regulon_heatmap_REG1_REG3.png"
+
+── Convergent TF × ATAC Plot ──
+IF ATAC data available:
+    MARK TFs with significant activity AND open ATAC motif
+    SAVE as "Convergent_TF_activity_and_ATAC.csv"
+    IF ≥ 3 convergent TFs:
+        PLOT volcano: logFC vs -log10(adj.P), colored by direction
+        SAVE as "10_Convergent_TF_ATAC.png"
+
+## ============================================================
+## STEP 12: USAGE INSTRUCTIONS FOR scRNA INTEGRATION
+## ============================================================
+WRITE "HOW_TO_USE_IN_scRNA.txt" containing:
+
+    ── Seurat (R) ──
+    - readLines() for each regulon .txt file
+    - AddModuleScore() with features = list(REG1=reg1, ...)
+    - VlnPlot() and FeaturePlot() examples
+
+    ── Scanpy (Python) ──
+    - pandas read_csv("ALL_REGULONS.csv")
+    - sc.tl.score_genes() in loop
+    - sc.pl.umap() and sc.pl.violin() examples
+
+    ── Expected Biology ──
+    - REG1: high in disease/stressed vCM (ATF1, NFE2L2, E2F4, CEBPB, NR2C2)
+    - REG2: fetal metabolic reprogramming
+    - REG3: lost in disease (STAT4, SOX9, IRF9 targets)
+    - REG4: chromatin-silenced genes
+    - REG5: SFRP4, FRZB, LUM — Wnt inhibitors + ECM (fibroblast check)
+
+## ============================================================
+## FINAL SUMMARY
+## ============================================================
+PRINT complete file inventory:
+    PLOTS (outputs/plots/):
+        01_PCA.png
+        02_Volcano.png
+        03_Heatmap_top50_DEGs.png
+        04_GSEA_Hallmark_barplot.png
+        04b_GSEA_enrichment_<pathway>.png
+        05_TF_activity_lollipop.png
+        05b_TF_activity_volcano.png
+        06_WGCNA_module_heatmap.png
+        06b_WGCNA_top_module_GO.png
+        07_HCM_panel_lollipop.png
+        08_Regulon_sizes.png
+        09_Regulon_heatmap_REG1_REG3.png
+        [10_Convergent_TF_ATAC.png — if ATAC present]
+
+    TABLES (outputs/tables/):
+        GSE141910_raw_counts_merged.csv
+        limma_full_results.csv
+        limma_significant_DEGs.csv
+        GSEA_Hallmark_significant.csv
+        GSEA_C2_significant.csv
+        TF_activity_HCM_vs_Control.csv
+        WGCNA_module_HCM_correlation.csv
+        WGCNA_all_module_genes.csv
+        WGCNA_top_module_GO_BP.csv
+        HCM_gene_panel.csv
+        [ATAC_motif_open_DCM.csv, ATAC_motif_closed_DCM.csv — if ATAC]
+        Convergent_TF_activity_and_ATAC.csv
+
+    REGULONS (outputs/regulons/):
+        REG1_UP_TF_active_targets.txt
+        REG2_UP_TF_independent.txt
+        REG3_DOWN_TF_repressed_targets.txt
+        REG4_DOWN_closed_chromatin.txt
+        REG5_WGCNA_ECM_hub.txt
+        ALL_REGULONS.csv
+        HOW_TO_USE_IN_scRNA.txt
+
+## ============================================================
+## APPENDIX A: STANDALONE VOLCANO PLOT SCRIPT
+## ============================================================
+LOAD counts from "outputs/tables/GSE141910_raw_counts_merged.csv"
+DEFINE metadata from column names (_C = Control, _P = HCM)
+RUN limma DE (design ~ condition)
+ANNOTATE with gene symbols via org.Hs.eg.db
+
+CLASSIFY significance (3 levels):
+    "NS" = default
+    "Up" = adj.P < 0.05 AND logFC > 0.5
+    "Down" = adj.P < 0.05 AND logFC < -0.5
+    FACTOR with levels c("Up", "Down", "NS")
+
+SELECT labels:
+    top20_up = top 20 Up genes by logFC
+    top20_down = top 20 Down genes by logFC (most negative)
+    label_df = rbind(top20_up, top20_down)
+
+PLOT volcano:
+    geom_point: all points colored by direction (red/blue/grey)
+    geom_text_repel: ONLY label_df genes (separate data argument)
+    THRESHOLD lines: vertical at ±0.5, horizontal at adj.P = 0.05
+    THEME: classic, legend on top, bold title
+SAVE as "Volcano_TopGenes_Labeled.png" (12×10 in, 300 dpi)
+
+## ============================================================
+## APPENDIX B: WGCNA MODULE SUMMARY TABLE (Python/gseapy)
+## ============================================================
+LOAD "WGCNA_all_module_genes.csv"
+CLEAN:
+    DROP rows with NA Symbol
+    REMOVE symbols starting with "ENSG"
+    DEDUPLICATE on [Module, Symbol]
+
+CALCULATE abs_kME = abs(kME)
+SELECT top 50 genes per module (highest abs_kME)
+
+FOR each unique module:
+    EXTRACT top 50 gene symbols
+    JOIN into comma-separated string
+
+    RUN Enrichr GO Biological Process 2023:
+        gene_list = top 50 genes
+        organism = "human"
+        IF results exist: GET top term (lowest Adjusted P-value)
+        ELSE: "NA"
+
+    RUN Enrichr GO Molecular Function 2023:
+        SAME process
+
+    APPEND row: Module, Top50_Genes, Top_Enriched_BP, Top_Enriched_MF
+
+SAVE as "WGCNA_module_summary_GO.csv"
